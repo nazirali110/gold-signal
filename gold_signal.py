@@ -57,12 +57,13 @@ def atr(b, p=14):
     return out
 
 
-def post(text):
+def post(text, silent=False):
     if not TOKEN or not CHAT_ID:
         print("TOKEN ya CHAT_ID set nahi hai:\n" + text)
         return
     url = "https://api.telegram.org/bot%s/sendMessage" % TOKEN
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+               "disable_notification": silent}
     http_json(url, json.dumps(payload).encode())
     print("Telegram par bhej diya.")
 
@@ -92,6 +93,18 @@ def main():
 
     if not (buy or sell):
         print("Koi signal nahi. Price %.2f RSI %.1f" % (c[i], r[i]))
+        if closed.minute == 0:
+            trend = "UPAR (price EMA100 se upar)" if c[i] > t[i] else "NEECHE (price EMA100 se neeche)"
+            cross = "EMA20 upar hai EMA50 se" if f[i] > s[i] else "EMA20 neeche hai EMA50 se"
+            post(
+                "📊 <b>XAUUSD M30 report</b>\n"
+                f"Price: <code>{c[i]:.2f}</code>\n"
+                f"Trend: {trend}\n"
+                f"{cross}\n"
+                f"RSI: {r[i]:.1f}\n"
+                "Signal: abhi koi nahi, bot nigrani kar raha hai.",
+                silent=True,
+            )
         return
     if age_min > 25:
         print("Signal purana hai (%.0f min), skip." % age_min)
