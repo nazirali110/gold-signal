@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -14,12 +15,20 @@ UA = {"User-Agent": "Mozilla/5.0 (gold-signal-bot)"}
 
 
 def http_json(url, data=None):
-    req = urllib.request.Request(url, headers=UA, data=data)
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        body = r.read()
-        return json.loads(body) if body else None
+    last = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(url, headers=UA, data=data)
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read()
+                return json.loads(body) if body else None
+        except Exception as ex:
+            last = ex
+            print("Koshish %d nakam: %s" % (attempt, ex))
+            time.sleep(4 * attempt)
+    raise last
 
 
 def ema(v, p):
