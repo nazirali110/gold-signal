@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
+time.sleep(75)
 
 # ----------------------------- SETTINGS -----------------------------
 HOURLY_MIN = 2     # har ghante kam az kam itne signal (zaroor)
