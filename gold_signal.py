@@ -6,6 +6,7 @@ NEW YORK SESSION (13:00-22:00 UTC = Pakistan 6 pm se 3 am):
 Baaqi sessions (Asia, London, Off) aur NY mein bhi:
     CHHOTE signals (M30/M15 setup + scalp), har ghante 2 se 4.
 Baaqi sessions mein ADVANCE signal bhi: "is price par SELL/BUY LIMIT laga lo".
+Data: pehle biquote, wo band ho to Yahoo (backup).
 """
 import json
 import os
@@ -71,6 +72,50 @@ def http_json(url, data=None):
             print("Koshish %d nakam: %s" % (attempt, ex))
             time.sleep(4 * attempt)
     raise last
+
+
+USED = set()        # agar backup data use hua to yahan naam aata hai
+BQ_DOWN = [False]   # biquote is run mein band mila to dobara koshish nahi
+YAHOO_MAP = {"1m": ("1m", "1d", 1), "5m": ("5m", "5d", 5), "15m": ("15m", "5d", 15),
+             "30m": ("30m", "5d", 30), "1h": ("60m", "1mo", 60)}
+
+
+def yahoo_bars(interval):
+    """Backup: Yahoo Finance se candles (newest pehle), biquote jaisi shakal mein."""
+    iv, rng, minutes = YAHOO_MAP[interval]
+    last = RuntimeError("Yahoo data nahi mila")
+    for sym in ("XAUUSD=X", "GC=F"):
+        try:
+            d = http_json("https://query1.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=%s"
+                          % (sym, rng, iv))
+            res = d["chart"]["result"][0]
+            q = res["indicators"]["quote"][0]
+            now = time.time()
+            out = []
+            for i, t in enumerate(res["timestamp"]):
+                o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+                if None in (o, h, l, c):
+                    continue
+                out.append({"openTime": datetime.fromtimestamp(t, timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "open": o, "high": h, "low": l, "close": c, "isOpen": t + minutes * 60 > now})
+            if len(out) >= 100:
+                USED.add("Yahoo " + sym)
+                return list(reversed(out))
+            last = RuntimeError("Yahoo %s: data kam (%d)" % (sym, len(out)))
+        except Exception as ex:
+            last = ex
+    raise last
+
+
+def get_bars(interval):
+    """Pehle biquote, band ho to Yahoo."""
+    if not BQ_DOWN[0]:
+        try:
+            return http_json(BASE_URL % interval)["bars"]
+        except Exception as ex:
+            BQ_DOWN[0] = True
+            print("biquote band, Yahoo backup try kar raha hoon:", ex)
+    return yahoo_bars(interval)
 
 
 def ema(v, p):
@@ -156,8 +201,7 @@ def side_at(i, bars, f, s, t, r, momentum=False):
 
 
 def scan(name, interval, minutes, sl, tp, m15=False):
-    data = http_json(BASE_URL % interval)
-    bars = [b for b in reversed(data["bars"]) if not b.get("isOpen")]
+    bars = [b for b in reversed(get_bars(interval)) if not b.get("isOpen")]
     if len(bars) < 100:
         raise RuntimeError("%s data kam hai (%d)" % (name, len(bars)))
     c = [b["close"] for b in bars]
@@ -184,8 +228,7 @@ def scan(name, interval, minutes, sl, tp, m15=False):
 
 def scan_h1():
     """H1 trend: har band H1 candle par (band hone ka waqt, EMA20 > EMA50 ?)."""
-    data = http_json(BASE_URL % "1h")
-    bars = [b for b in reversed(data["bars"]) if not b.get("isOpen")]
+    bars = [b for b in reversed(get_bars("1h")) if not b.get("isOpen")]
     c = [b["close"] for b in bars]
     f, s = ema(c, 20), ema(c, 50)
     return [(parse_ts(b["openTime"]) + timedelta(hours=1), f[i] > s[i]) for i, b in enumerate(bars)]
@@ -367,7 +410,6 @@ def fmt_signal(e, now):
         pkt = e["closed"] + timedelta(hours=NY_LIMIT_VALID_H + 5)     # Pakistan waqt = UTC + 5
         word = "BUY LIMIT" if buy else "SELL LIMIT"
         gap = abs(e["price"] - en)
-        side_txt = "neeche" if buy else "upar"
         return (
             f"{icon} <b>XAUUSD — {word} (pehle se order)</b>\n"
             f"⭐⭐ NEW YORK bada signal #{e['n']}/{NY_MAX_SIGNALS}\n"
@@ -460,6 +502,8 @@ def main():
         if age > FRESH_MIN or age < 0:
             continue
         text, _ = fmt_signal(e, now)
+        if USED:
+            text += "\n⚠️ Backup data (%s) se bana. Price aap ke broker se thora alag ho sakta hai, MT5 ki price dekh kar hi order lagayein." % ", ".join(sorted(USED))
         post(text)
         sent += 1
 
@@ -482,7 +526,8 @@ def main():
             f"Trend: {trend}\n{cross}\n"
             f"RSI: {last30['rsi']:.1f}\n"
             f"Session: {sess}\n{ny_line}"
-            "Signal: abhi koi naya nahi, bot nigrani kar raha hai.",
+            "Signal: abhi koi naya nahi, bot nigrani kar raha hai."
+            + ("\n⚠️ Backup data (%s) use hua." % ", ".join(sorted(USED)) if USED else ""),
             silent=True,
         )
 
