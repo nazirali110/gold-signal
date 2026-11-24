@@ -6,7 +6,6 @@ NEW YORK SESSION (13:00-22:00 UTC = Pakistan 6 pm se 3 am):
 Baaqi sessions (Asia, London, Off) aur NY mein bhi:
     CHHOTE signals (M30/M15 setup + scalp), har ghante 2 se 4.
 Baaqi sessions mein ADVANCE signal bhi: "is price par SELL/BUY LIMIT laga lo".
-Data: pehle biquote, wo band ho to Yahoo (backup).
 """
 import json
 import os
@@ -410,6 +409,7 @@ def fmt_signal(e, now):
         pkt = e["closed"] + timedelta(hours=NY_LIMIT_VALID_H + 5)     # Pakistan waqt = UTC + 5
         word = "BUY LIMIT" if buy else "SELL LIMIT"
         gap = abs(e["price"] - en)
+        side_txt = "neeche" if buy else "upar"
         return (
             f"{icon} <b>XAUUSD — {word} (pehle se order)</b>\n"
             f"⭐⭐ NEW YORK bada signal #{e['n']}/{NY_MAX_SIGNALS}\n"
