@@ -1,61 +1,62 @@
-"""XAUUSD signal bot -> Telegram.
+"""XAUUSD signal bot -> Telegram  (version 2)
 
-NEW YORK SESSION (13:00-22:00 UTC = Pakistan 6 pm se 3 am):
-    zyada se zyada 2 BADE signals PEHLE SE (LIMIT order ka level), SL 10$, TP1, TP2.
-    Filters: H1 + M30 dono trend ke saath, EMA20 tak wapsi (pullback).
-Baaqi sessions (Asia, London, Off) aur NY mein bhi:
-    CHHOTE signals (M30/M15 setup + scalp), har ghante 2 se 4.
-Baaqi sessions mein ADVANCE signal bhi: "is price par SELL/BUY LIMIT laga lo".
+BADA signal  : target 10-15$  -> PEHLE SE bheja jata hai: "yahan BUY/SELL LIMIT laga lo"
+CHHOTA signal: SCALP target 5$ -> candle band hone par, "abhi lagao"
+Har signal par likha hota hai ke bada hai ya chhota.
+Signal ka natija (profit / loss / fill nahi hua) bhi Telegram par aata hai.
+Data: biquote, wo band ho to Yahoo (backup).
 """
 import json
 import os
 import sys
 import time
 import urllib.request
+from bisect import bisect_left, bisect_right
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
-# ----------------------------- SETTINGS -----------------------------
-# New York quality signals (dollar mein)
-NY_MAX_SIGNALS = 2     # NY session mein zyada se zyada itne bade signal
-NY_SL = 10.0           # Stop Loss
-NY_TP1 = 7.5           # Target 1 (5 se 10 ke beech)
-NY_TP2 = 15.0          # Target 2 (10 se 20 ke beech)
-NY_MODE = "limit"      # "limit" = pehle se order ka level (signal peshgi), "market" = candle band hone par
-NY_GAP_MIN = 45        # do NY signals ke beech kam az kam itne minute (market mode)
-NY_LIMIT_GAP_MIN = 90  # do NY limit signals ke beech kam az kam itne minute
-NY_LIMIT_MIN_DIST = 1.5   # price level se kam az kam itna door ho (dollar)
-NY_LIMIT_MAX_DIST = 12.0  # aur zyada se zyada itna door (warna wapsi ka imkaan kam)
-NY_LIMIT_VALID_H = 4   # order itne ghante tak valid
-NY_RELAX_HOUR = 16     # is UTC ghante (Pakistan 9 pm) ke baad, agar 2 signal na bane to filter thora dheela
-# ADVANCE signal baaqi sessions mein (pehle se batata hai: "is price par SELL/BUY LIMIT laga lo")
-PENDING_ON = True
-PEND_MIN_GAP = 1.0     # level price se kam az kam itna door (dollar)
-PEND_MAX_GAP = 8.0     # ...aur zyada se zyada itna door
-PEND_VALID_MIN = 60    # order itne minute tak rakhein, phir cancel
-PEND_SL, PEND_TP1, PEND_TP2 = 3.0, 4.5, 9.0   # NY ke ilawa baaqi sessions mein (dollar)
-# Chhote signals (har session mein)
-HOURLY_MIN = 2         # har ghante kam az kam itne signal
-HOURLY_MAX = 4         # har ghante zyada se zyada itne signal (M30 quality is hisaab se bahar hain)
-M30_SL, M30_TP = 2.5, 5.0
-M15_SL, M15_TP = 1.5, 3.0
-M5_SL, M5_TP = 1.0, 2.0
-M1_SL, M1_TP = 0.6, 1.2
-SCALP_SL, SCALP_TP = 1.5, 3.0
-USE_M5 = False         # M5 ke signal (cron-job.org har 5 minute par hona chahiye)
-USE_M1 = False         # M1: bohat shor, har 1 minute par chalana parta hai. Abhi band.
+# ============================== SETTINGS ==============================
+# --- BADA signal (limit order, pehle se) ---
+BIG_SL, BIG_TP1, BIG_TP2 = 10.0, 10.0, 15.0   # dollar
+BIG_VALID_H = 4            # order itne ghante valid
+BIG_EXPIRE_H = 12          # order lagne ke baad itne ghante tak natija dekha jata hai
+BIG_MAX_PER_SESSION = 2    # London / New York mein zyada se zyada itne bade signal
+BIG_GAP_MIN = 90           # do bade signal ke beech kam az kam itne minute
+BIG_MIN_DIST, BIG_MAX_DIST = 1.5, 8.0    # order ka level price se kitna door (dollar)
+BIG_MIN_ATR = 4.0          # M30 mein itni harkat ho tab hi bada signal
+BIG_SESSIONS = ("London", "New York")
+# --- CHHOTA signal (scalp, abhi lagao) ---
+SCALP_SL, SCALP_TP = 3.0, 5.0
+SCALP_MIN_ATR = 2.0        # M15 mein itni harkat ho tab hi scalp
+SCALP_GAP_MIN = 30         # ek hi taraf ke do scalp ke beech kam az kam itne minute
+SCALP_MAX_PER_HOUR = 3
+SCALP_MAX_AGE = 6.0        # candle band hue itne minute se zyada ho to signal NAHI bheja jata
+SCALP_STALE_MAX = 1.0      # price entry se itni (dollar) door ho gayi ho to signal NAHI bheja jata
+SCALP_EXPIRE_H = 3         # itne ghante mein TP/SL na lage to "expire" ka message
+# --- natija (profit / loss) ---
+RESULTS_ON = True
+# --- baqi ---
 TREND = 100
-RUN_EVERY_MIN = 15     # cron-job.org bot ko kitne minute baad chalata hai (5 ya 15)
-FRESH_MIN = RUN_EVERY_MIN - 0.1   # itne minute tak ke naye signal bheje jate hain
-WAIT_SECONDS = 75      # candle ka data aane tak intezar
-# --------------------------------------------------------------------
+RUN_EVERY_MIN = 15         # cron-job.org bot ko kitne minute baad chalata hai
+FRESH_MIN = RUN_EVERY_MIN - 0.1
+WAIT_SECONDS = 75          # candle ka data final hone tak intezar
+# ======================================================================
 
 BASE_URL = "https://biquote.io/api/XAUUSD/ohlc?interval=%s&limit=300"
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 TEST = os.environ.get("TEST_MESSAGE", "").strip() == "1"
 UA = {"User-Agent": "Mozilla/5.0 (gold-signal-bot)"}
+USED = set()        # backup data use hua to naam yahan aata hai
+BQ_DOWN = [False]   # biquote is run mein band mila to dobara koshish nahi
+YAHOO_MAP = {"15m": ("15m", "5d", 15), "30m": ("30m", "5d", 30), "1h": ("60m", "1mo", 60)}
 
 
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+# ------------------------------ data ------------------------------
 def http_json(url, data=None):
     last = None
     for attempt in range(1, 4):
@@ -73,14 +74,7 @@ def http_json(url, data=None):
     raise last
 
 
-USED = set()        # agar backup data use hua to yahan naam aata hai
-BQ_DOWN = [False]   # biquote is run mein band mila to dobara koshish nahi
-YAHOO_MAP = {"1m": ("1m", "1d", 1), "5m": ("5m", "5d", 5), "15m": ("15m", "5d", 15),
-             "30m": ("30m", "5d", 30), "1h": ("60m", "1mo", 60)}
-
-
 def yahoo_bars(interval):
-    """Backup: Yahoo Finance se candles (newest pehle), biquote jaisi shakal mein."""
     iv, rng, minutes = YAHOO_MAP[interval]
     last = RuntimeError("Yahoo data nahi mila")
     for sym in ("XAUUSD=X", "GC=F"):
@@ -107,7 +101,6 @@ def yahoo_bars(interval):
 
 
 def get_bars(interval):
-    """Pehle biquote, band ho to Yahoo."""
     if not BQ_DOWN[0]:
         try:
             return http_json(BASE_URL % interval)["bars"]
@@ -117,6 +110,11 @@ def get_bars(interval):
     return yahoo_bars(interval)
 
 
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# ---------------------------- indicators ----------------------------
 def ema(v, p):
     k, e, out = 2 / (p + 1), v[0], []
     for i, x in enumerate(v):
@@ -141,23 +139,47 @@ def rsi(c, p=14):
     return out
 
 
-def post(text, silent=False):
-    if not TOKEN or not CHAT_ID:
-        print("TOKEN ya CHAT_ID set nahi hai:\n" + text)
-        return
-    url = "https://api.telegram.org/bot%s/sendMessage" % TOKEN
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-               "disable_notification": silent}
-    http_json(url, json.dumps(payload).encode())
-    print("Telegram par bhej diya.")
+def atr(h, l, c, p=14):
+    out, a = [0.0] * len(c), 0.0
+    for i in range(1, len(c)):
+        tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+        a = a + tr / p if i <= p else (a * (p - 1) + tr) / p
+        out[i] = a
+    return out
 
 
-def parse_ts(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def load(interval, minutes):
+    raw = get_bars(interval)
+    live = float(raw[0]["close"])                       # sab se taaza (chalti candle ki) price
+    bars = [b for b in reversed(raw) if not b.get("isOpen")]
+    if len(bars) < 100:
+        raise RuntimeError("%s data kam hai (%d)" % (interval, len(bars)))
+    c = [b["close"] for b in bars]
+    h = [b["high"] for b in bars]
+    l = [b["low"] for b in bars]
+    o = [b.get("open", c[i - 1] if i else c[0]) for i, b in enumerate(bars)]
+    open_t = [parse_ts(b["openTime"]) for b in bars]
+    return {"n": len(bars), "live": live, "c": c, "h": h, "l": l, "o": o,
+            "f": ema(c, 20), "s": ema(c, 50), "t": ema(c, TREND), "r": rsi(c), "a": atr(h, l, c),
+            "open_t": open_t, "closed": [t + timedelta(minutes=minutes) for t in open_t]}
 
 
+def scan_h1():
+    """H1 trend: (band hone ka waqt, EMA20 > EMA50 ?) ki list."""
+    bars = [b for b in reversed(get_bars("1h")) if not b.get("isOpen")]
+    c = [b["close"] for b in bars]
+    f, s = ema(c, 20), ema(c, 50)
+    return [(parse_ts(b["openTime"]) + timedelta(hours=1), f[i] > s[i]) for i, b in enumerate(bars)]
+
+
+def h1_up(h1, ts):
+    times = [x[0] for x in h1]
+    k = bisect_right(times, ts) - 1
+    return h1[k][1] if k >= 0 else None
+
+
+# ------------------------------ helpers ------------------------------
 def session_of(dt):
-    """Naam (UTC): Asia 00-08, London 08-13, New York 13-22."""
     h = dt.hour
     if h < 8:
         return "Asia"
@@ -169,18 +191,16 @@ def session_of(dt):
 
 
 def sess_close(ts):
-    """Candle jis session mein bani, uska naam (band hone ke waqt se ek minute pehle)."""
     return session_of(ts - timedelta(minutes=1))
 
 
-def hour_key(closed):
-    return (closed - timedelta(minutes=1)).replace(minute=0, second=0, microsecond=0)
+def pk(dt):
+    return (dt + timedelta(hours=5)).strftime("%I:%M %p")      # Pakistan waqt
 
 
-def side_at(i, bars, f, s, t, r, momentum=False):
-    b = bars[i]
-    c, h, l = b["close"], b["high"], b["low"]
-    o = b.get("open", bars[i - 1]["close"])
+def side_at(i, S):
+    c, h, l, o = S["c"][i], S["h"][i], S["l"][i], S["o"][i]
+    f, s, t, r = S["f"], S["s"], S["t"], S["r"]
     if f[i] > s[i] and f[i - 1] <= s[i - 1] and c > t[i] and 50 < r[i] < 70:
         return "BUY", "EMA cross"
     if f[i] < s[i] and f[i - 1] >= s[i - 1] and c < t[i] and 30 < r[i] < 50:
@@ -189,345 +209,281 @@ def side_at(i, bars, f, s, t, r, momentum=False):
         return "BUY", "Trend pullback"
     if f[i] < s[i] < t[i] and h >= f[i] and c < f[i] and c < o and 25 < r[i] < 55:
         return "SELL", "Trend pullback"
-    if momentum and i >= 6:
-        lo = min(x["low"] for x in bars[i - 6:i])
-        hi = max(x["high"] for x in bars[i - 6:i])
-        if f[i] < s[i] and c < lo and c < o and 10 < r[i] < 40:
-            return "SELL", "Momentum (risky)"
-        if f[i] > s[i] and c > hi and c > o and 60 < r[i] < 90:
-            return "BUY", "Momentum (risky)"
     return None
 
 
-def scan(name, interval, minutes, sl, tp, m15=False):
-    bars = [b for b in reversed(get_bars(interval)) if not b.get("isOpen")]
-    if len(bars) < 100:
-        raise RuntimeError("%s data kam hai (%d)" % (name, len(bars)))
-    c = [b["close"] for b in bars]
-    f, s, t = ema(c, 20), ema(c, 50), ema(c, TREND)
-    r = rsi(c)
-    events, info = [], []
-    for i in range(80, len(bars)):
-        closed = parse_ts(bars[i]["openTime"]) + timedelta(minutes=minutes)
-        cur = side_at(i, bars, f, s, t, r, m15)
-        prev = side_at(i - 1, bars, f, s, t, r, m15)
-        if cur and cur != prev:
-            events.append({"tf": name, "closed": closed, "side": cur[0], "kind": cur[1],
-                           "entry": c[i], "rsi": r[i], "sl": sl, "tp": tp, "scalp": False})
-        o = bars[i].get("open", bars[i - 1]["close"])
-        bias = "BUY" if f[i] > s[i] else "SELL"
-        agrees = (c[i] > o) if bias == "BUY" else (c[i] < o)
-        info.append({"closed": closed, "bias": bias, "agrees": agrees, "entry": c[i], "rsi": r[i],
-                     "f": f[i], "s": s[i], "t": t[i]})
-    i = len(bars) - 1
-    last = {"close": c[i], "f": f[i], "s": s[i], "t": t[i], "rsi": r[i],
-            "closed": parse_ts(bars[i]["openTime"]) + timedelta(minutes=minutes)}
-    return events, info, last
-
-
-def scan_h1():
-    """H1 trend: har band H1 candle par (band hone ka waqt, EMA20 > EMA50 ?)."""
-    bars = [b for b in reversed(get_bars("1h")) if not b.get("isOpen")]
-    c = [b["close"] for b in bars]
-    f, s = ema(c, 20), ema(c, 50)
-    return [(parse_ts(b["openTime"]) + timedelta(hours=1), f[i] > s[i]) for i, b in enumerate(bars)]
-
-
-def ny_quality(regular, h1):
-    """New York ke bade (lambay) signal, zyada se zyada NY_MAX_SIGNALS.
-    Pehle STRICT: M30 setup + H1 trend + RSI band.
-    Agar NY_RELAX_HOUR tak 2 na bane to RELAXED: M30/M15 koi bhi setup + H1 trend (RSI 30 se 70)."""
-    out, key, accepted = [], None, []
-    cands = [e for e in regular if e["tf"] in ("M30", "M15")]
-    for e in sorted(cands, key=lambda e: e["closed"]):
-        if sess_close(e["closed"]) != "New York":
+# ----------------------------- signals -----------------------------
+def gen_scalps(S, h1):
+    """CHHOTA signal (target 5$): M15 setup + H1 trend + RSI theek + kafi harkat (ATR)."""
+    out, last_t, per_hour = [], {}, Counter()
+    for i in range(80, S["n"]):
+        cur, prev = side_at(i, S), side_at(i - 1, S)
+        if not cur or cur == prev:
             continue
-        up = None
-        for ts, is_up in h1:                      # sab se taaza band H1 jo is waqt tak band ho chuki
-            if ts <= e["closed"]:
-                up = is_up
-        if up is None or (e["side"] == "BUY") != up:
-            continue                              # H1 trend ke khilaf signal nahi
-        k = (e["closed"] - timedelta(minutes=1)).replace(hour=13, minute=0, second=0, microsecond=0)
-        if k != key:
-            key, accepted = k, []
-        if len(accepted) >= NY_MAX_SIGNALS:
+        side, kind = cur
+        closed, r = S["closed"][i], S["r"][i]
+        up = h1_up(h1, closed)
+        if up is None or (side == "BUY") != up:
             continue
-        if accepted and (e["closed"] - accepted[-1]["closed"]) < timedelta(minutes=NY_GAP_MIN):
+        if not ((45 < r < 68) if side == "BUY" else (32 < r < 55)):
             continue
-        rsi_ok = (45 < e["rsi"] < 65) if e["side"] == "BUY" else (35 < e["rsi"] < 55)
-        strict = e["tf"] == "M30" and e["kind"] in ("EMA cross", "Trend pullback") and rsi_ok
-        if not strict:
-            late = (e["closed"] - timedelta(minutes=1)).hour >= NY_RELAX_HOUR
-            if not (late and 30 < e["rsi"] < 70):
-                continue
-        e = dict(e, ny=True, relaxed=not strict, n=len(accepted) + 1, session="New York")
-        accepted.append(e)
-        out.append(e)
+        if S["a"][i] < SCALP_MIN_ATR:
+            continue
+        if side in last_t and (closed - last_t[side]) < timedelta(minutes=SCALP_GAP_MIN):
+            continue
+        hk = (closed - timedelta(minutes=1)).replace(minute=0, second=0, microsecond=0)
+        if per_hour[hk] >= SCALP_MAX_PER_HOUR:
+            continue
+        per_hour[hk] += 1
+        last_t[side] = closed
+        out.append({"type": "scalp", "side": side, "kind": kind, "closed": closed, "entry": S["c"][i],
+                    "sl": SCALP_SL, "tp": SCALP_TP, "rsi": r, "session": sess_close(closed)})
     return out
 
 
-def ny_limits(info30, h1):
-    """New York ke bade signal PEHLE SE: pullback ka limit-order level (EMA20).
-    SELL LIMIT: M30 + H1 dono neeche ka trend, price EMA20 se neeche -> order EMA20 par.
-    BUY LIMIT : M30 + H1 dono upar ka trend, price EMA20 se upar  -> order EMA20 par."""
-    out, key, accepted = [], None, []
-    for x in sorted(info30, key=lambda x: x["closed"]):
-        if sess_close(x["closed"]) != "New York":
+def gen_bigs(S, h1):
+    """BADA signal (target 10-15$): pullback ke liye LIMIT order ka level (M30 EMA20)."""
+    out, cnt, last = [], Counter(), None
+    for i in range(80, S["n"]):
+        closed = S["closed"][i]
+        sess = sess_close(closed)
+        if sess not in BIG_SESSIONS:
             continue
-        up = None
-        for ts, is_up in h1:
-            if ts <= x["closed"]:
-                up = is_up
-        if up is None:
+        up = h1_up(h1, closed)
+        if up is None or S["a"][i] < BIG_MIN_ATR:
             continue
-        c, level = x["entry"], x["f"]
-        if up and x["f"] > x["s"] > x["t"] and 40 < x["rsi"] < 80 and \
-                NY_LIMIT_MIN_DIST <= c - level <= NY_LIMIT_MAX_DIST:
+        c, level, r = S["c"][i], S["f"][i], S["r"][i]
+        f, s, t = S["f"][i], S["s"][i], S["t"][i]
+        if up and f > s > t and 40 < r < 80 and BIG_MIN_DIST <= c - level <= BIG_MAX_DIST:
             side = "BUY"
-        elif (not up) and x["f"] < x["s"] < x["t"] and 20 < x["rsi"] < 60 and \
-                NY_LIMIT_MIN_DIST <= level - c <= NY_LIMIT_MAX_DIST:
+        elif (not up) and f < s < t and 20 < r < 60 and BIG_MIN_DIST <= level - c <= BIG_MAX_DIST:
             side = "SELL"
         else:
             continue
-        k = (x["closed"] - timedelta(minutes=1)).replace(hour=13, minute=0, second=0, microsecond=0)
-        if k != key:
-            key, accepted = k, []
-        if len(accepted) >= NY_MAX_SIGNALS:
+        key = ((closed - timedelta(minutes=1)).date(), sess)
+        if cnt[key] >= BIG_MAX_PER_SESSION:
             continue
-        if accepted and (x["closed"] - accepted[-1]["closed"]) < timedelta(minutes=NY_LIMIT_GAP_MIN):
+        if last and (closed - last) < timedelta(minutes=BIG_GAP_MIN):
             continue
-        e = {"tf": "M30", "closed": x["closed"], "side": side, "kind": "Pullback limit",
-             "entry": level, "price": c, "rsi": x["rsi"], "ny": True, "limit": True,
-             "relaxed": False, "n": len(accepted) + 1, "session": "New York"}
-        accepted.append(e)
-        out.append(e)
+        cnt[key] += 1
+        last = closed
+        out.append({"type": "big", "side": side, "kind": "Pullback limit", "closed": closed, "level": level,
+                    "price": c, "sl": BIG_SL, "tp1": BIG_TP1, "tp2": BIG_TP2, "rsi": r, "session": sess})
     return out
 
 
-def pending_alerts(info15, h1):
-    """ADVANCE signal: trend ke saath, EMA20 tak wapsi (pullback) ke liye pehle se LIMIT order ka level.
-    Ek hi taraf ka dobara signal kam az kam 60 minute baad."""
-    out, last = [], {"BUY": -99, "SELL": -99}
-    for j, x in enumerate(info15):
-        if NY_MODE == "limit" and sess_close(x["closed"]) == "New York":
-            continue                                    # NY mein bade limit signal alag se aate hain
-        up = None
-        for ts, is_up in h1:
-            if ts <= x["closed"]:
-                up = is_up
-        if up is None:
-            continue
-        side = None
-        gap = x["f"] - x["entry"]                       # level price se kitna upar (SELL) / neeche (BUY)
-        if (not up) and x["f"] < x["s"] < x["t"] and PEND_MIN_GAP <= gap <= PEND_MAX_GAP and 25 < x["rsi"] < 55:
-            side = "SELL"
-        elif up and x["f"] > x["s"] > x["t"] and PEND_MIN_GAP <= -gap <= PEND_MAX_GAP and 45 < x["rsi"] < 75:
-            side = "BUY"
-        if side and j - last[side] >= 4:
-            last[side] = j
-            out.append({"pending": True, "tf": "M15", "side": side, "closed": x["closed"],
-                        "level": x["f"], "price": x["entry"], "rsi": x["rsi"], "ny": False,
-                        "scalp": False, "kind": "Advance", "session": sess_close(x["closed"]), "n": 0})
-    return out
+# ------------------------------ natija ------------------------------
+def R(kind, time_, pnl):
+    return {"kind": kind, "time": time_, "pnl": pnl}
 
 
-def build(regular, info15, big_keys=frozenset()):
-    """Chhote signals (har session mein): asal setup pehle, phir scalp se HOURLY_MIN poora.
-    big_keys: wo NY bade signals jo alag se bheje jate hain (dobara nahi bheje jate)."""
-    times = sorted({e["closed"] for e in regular} | {x["closed"] for x in info15})
-    by_t_reg, by_t_info = {}, {}
-    for e in regular:
-        by_t_reg.setdefault(e["closed"], []).append(e)
-    for x in info15:
-        by_t_info[x["closed"]] = x
-    out, count, key = [], 0, None
-    for ts in times:
-        k = hour_key(ts)
-        if k != key:
-            key, count = k, 0
-        got = False
-        order = {"M30": 0, "M15": 1, "M5": 2, "M1": 3}
-        for e in sorted(by_t_reg.get(ts, []), key=lambda e: order.get(e["tf"], 9)):
-            if (e["tf"], e["closed"], e["side"]) in big_keys:
-                count += 1               # ye NY ka bada signal hai, alag se jata hai
-                got = True
-                continue
-            if e["tf"] == "M30" or count < HOURLY_MAX:
-                count += 1
-                e = dict(e, n=count, session=sess_close(ts), ny=False)
-                out.append(e)
-                got = True
-        x = by_t_info.get(ts)
-        if x is not None and not got and count < HOURLY_MIN:
-            pos = 4 if ts.minute == 0 else ts.minute // 15
-            bars_left = 4 - pos + 1
-            need = HOURLY_MIN - count
-            if x["agrees"] or bars_left <= need:
-                count += 1
-                out.append({"tf": "M15", "closed": ts, "side": x["bias"], "kind": "Scalp",
-                            "entry": x["entry"], "rsi": x["rsi"], "sl": SCALP_SL, "tp": SCALP_TP,
-                            "scalp": True, "n": count, "session": sess_close(ts), "ny": False})
-    return out
+def outcome(ev, S):
+    """Signal ke baad ki M15 candles dekh kar natija. SL aur TP ek hi candle mein ho to LOSS maana jata hai."""
+    n, ot, cl = S["n"], S["open_t"], S["closed"]
+    buy = ev["side"] == "BUY"
+    start = bisect_left(ot, ev["closed"])
+    if ev["type"] == "scalp":
+        entry, sl, tp = ev["entry"], ev["sl"], ev["tp"]
+        end = ev["closed"] + timedelta(hours=SCALP_EXPIRE_H)
+        for j in range(start, n):
+            if ot[j] >= end:
+                return [R("expired", cl[j], 0)]
+            adv = (entry - S["l"][j]) if buy else (S["h"][j] - entry)
+            fav = (S["h"][j] - entry) if buy else (entry - S["l"][j])
+            if adv >= sl:
+                return [R("loss", cl[j], -sl)]
+            if fav >= tp:
+                return [R("win", cl[j], tp)]
+        return []
+    level, sl, tp1, tp2 = ev["level"], ev["sl"], ev["tp1"], ev["tp2"]
+    vend = ev["closed"] + timedelta(hours=BIG_VALID_H)
+    fill = None
+    for j in range(start, n):
+        if ot[j] >= vend:
+            return [R("nofill", cl[j], 0)]
+        if (buy and S["l"][j] <= level) or ((not buy) and S["h"][j] >= level):
+            fill = j
+            break
+    if fill is None:
+        return []
+
+    def adv(j):
+        return (level - S["l"][j]) if buy else (S["h"][j] - level)
+
+    def fav(j):
+        return (S["h"][j] - level) if buy else (level - S["l"][j])
+
+    if adv(fill) >= sl:                      # jis candle mein order laga, usi mein SL
+        return [R("loss", cl[fill], -sl)]
+    expire = cl[fill] + timedelta(hours=BIG_EXPIRE_H)
+    res, stage = [], 0
+    for k in range(fill + 1, n):
+        if ot[k] >= expire:
+            break
+        if stage == 0:
+            if adv(k) >= sl:
+                return [R("loss", cl[k], -sl)]
+            if fav(k) >= tp1:
+                res.append(R("tp1", cl[k], tp1))
+                stage = 1
+                if fav(k) >= tp2:
+                    res.append(R("tp2", cl[k], tp2))
+                    break
+        else:
+            if fav(k) >= tp2:
+                res.append(R("tp2", cl[k], tp2))
+                break
+            if adv(k) >= 0:                  # SL entry par tha: chup chaap band
+                break
+    return res
 
 
-def fmt_pending(e, now):
-    age = (now - e["closed"]).total_seconds() / 60
-    buy = e["side"] == "BUY"
-    sgn = 1 if buy else -1
-    lv = e["level"]
-    if e["session"] == "New York":
-        sl, t1, t2 = NY_SL, NY_TP1, NY_TP2
-    else:
-        sl, t1, t2 = PEND_SL, PEND_TP1, PEND_TP2
-    word = "BUY LIMIT" if buy else "SELL LIMIT"
+# ------------------------------ messages ------------------------------
+def post(text, silent=False):
+    if not TOKEN or not CHAT_ID:
+        print("TOKEN ya CHAT_ID set nahi hai:\n" + text)
+        return
+    url = "https://api.telegram.org/bot%s/sendMessage" % TOKEN
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_notification": silent}
+    http_json(url, json.dumps(payload).encode())
+    print("Telegram par bhej diya.")
+
+
+def warn_line():
+    if not USED:
+        return ""
+    return "\n⚠️ Backup data (%s) se bana. Price broker se thori alag ho sakti hai, MT5 ki price dekh kar hi lagayein." % ", ".join(sorted(USED))
+
+
+def ident(ev):
+    if ev["type"] == "big":
+        w = "BUY LIMIT" if ev["side"] == "BUY" else "SELL LIMIT"
+        return "%s @ %.2f" % (w, ev["level"])
+    return "%s @ %.2f" % (ev["side"], ev["entry"])
+
+
+def fmt_signal(ev, live, now):
+    age = (now - ev["closed"]).total_seconds() / 60
+    buy = ev["side"] == "BUY"
+    sg = 1 if buy else -1
     icon = "🟢" if buy else "🔴"
-    return (
-        f"⏰ <b>ADVANCE signal — {word}</b>\n"
-        f"{icon} XAUUSD | Session: {e['session']}\n"
-        f"Abhi price: <code>{e['price']:.2f}</code>\n"
-        f"{word} lagayein: <code>{lv:.2f}</code>\n"
-        f"Stop Loss: <code>{lv - sgn * sl:.2f}</code> ({sl:g}$)\n"
-        f"TP1: <code>{lv + sgn * t1:.2f}</code> ({t1:g}$)\n"
-        f"TP2: <code>{lv + sgn * t2:.2f}</code> ({t2:g}$)\n"
-        f"RSI: {e['rsi']:.1f} | Trend ke saath (H1 + M15) | {age:.0f} minute pehle bana\n"
-        f"<i>Ye pending order hai: price level tak aaye to khud lag jayega. "
-        f"{PEND_VALID_MIN} minute tak na lage to cancel kar dein. "
-        f"Price level se aage nikal chuki ho to is signal ko chhor dein.</i>"
-    ), age
-
-
-def fmt_signal(e, now):
-    if e.get("pending"):
-        return fmt_pending(e, now)
-    age = (now - e["closed"]).total_seconds() / 60
-    buy = e["side"] == "BUY"
-    en = e["entry"]
-    icon = "🟢" if buy else "🔴"
-    sgn = 1 if buy else -1
-    if e.get("limit"):
-        pkt = e["closed"] + timedelta(hours=NY_LIMIT_VALID_H + 5)     # Pakistan waqt = UTC + 5
+    if ev["type"] == "big":
+        lv = ev["level"]
         word = "BUY LIMIT" if buy else "SELL LIMIT"
-        gap = abs(e["price"] - en)
-        side_txt = "neeche" if buy else "upar"
+        valid = ev["closed"] + timedelta(hours=BIG_VALID_H)
         return (
-            f"{icon} <b>XAUUSD — {word} (pehle se order)</b>\n"
-            f"⭐⭐ NEW YORK bada signal #{e['n']}/{NY_MAX_SIGNALS}\n"
-            f"Order abhi MT5 mein lagayein:\n"
-            f"<b>{word} @ <code>{en:.2f}</code></b>\n"
-            f"Stop Loss: <code>{en - sgn * NY_SL:.2f}</code> ({NY_SL:g}$)\n"
-            f"TP1: <code>{en + sgn * NY_TP1:.2f}</code> ({NY_TP1:g}$)\n"
-            f"TP2: <code>{en + sgn * NY_TP2:.2f}</code> ({NY_TP2:g}$)\n"
-            f"Abhi price {e['price']:.2f}, order level se {gap:.1f}$ door. "
-            f"H1 aur M30 dono trend ke saath. RSI {e['rsi']:.0f}.\n"
-            f"Valid: {NY_LIMIT_VALID_H} ghante ({pkt.strftime('%I:%M %p')} Pakistan tak). Us tak order na khule to cancel karein.\n"
-            f"<i>Price order tak aaye baghair {NY_TP2:g}$ door chali jaye to bhi cancel karein. "
-            f"TP1 par aadha band karein aur SL entry par le aayein.</i>"
-        ), age
-    if e["ny"]:
-        tag = ("⭐ NEW YORK signal (filter thora dheela, TP1 par jaldi nikalein)" if e.get("relaxed")
-               else "⭐⭐ NEW YORK QUALITY signal")
-        return (
-            f"{icon} <b>XAUUSD {e['tf']} — {e['side']}</b> ({e['kind']})\n"
-            f"{tag} #{e['n']}/{NY_MAX_SIGNALS}\n"
-            f"Entry: <code>{en:.2f}</code>\n"
-            f"Stop Loss: <code>{en - sgn * NY_SL:.2f}</code> ({NY_SL:g}$)\n"
-            f"TP1: <code>{en + sgn * NY_TP1:.2f}</code> ({NY_TP1:g}$)\n"
-            f"TP2: <code>{en + sgn * NY_TP2:.2f}</code> ({NY_TP2:g}$)\n"
-            f"RSI: {e['rsi']:.1f} | H1 trend ke saath | Candle band hui {age:.0f} minute pehle\n"
-            f"<i>TP1 lagne par aadha band karein aur SL entry par le aayein. "
-            f"Price entry se door chali gayi ho to trade na lein.</i>"
-        ), age
-    sl = en - sgn * e["sl"]
-    tp = en + sgn * e["tp"]
-    if e["scalp"]:
-        tag = "⚡ Scalp signal (zyada risky, pehle demo par)"
-    elif e["tf"] == "M30":
-        tag = "⭐ M30 setup"
-    else:
-        tag = "⭐ %s setup (chhota SL/Target, zyada risky)" % e["tf"]
+            f"🟣 <b>BADA SIGNAL — target {ev['tp1']:g} se {ev['tp2']:g}$</b>\n"
+            f"{icon} XAUUSD {word} (pehle se order)\n"
+            f"MT5 mein abhi lagayein: <b>{word} @ <code>{lv:.2f}</code></b>\n"
+            f"Stop Loss: <code>{lv - sg * ev['sl']:.2f}</code> ({ev['sl']:g}$)\n"
+            f"TP1: <code>{lv + sg * ev['tp1']:.2f}</code> ({ev['tp1']:g}$)\n"
+            f"TP2: <code>{lv + sg * ev['tp2']:.2f}</code> ({ev['tp2']:g}$)\n"
+            f"Abhi price {live:.2f}, level {abs(live - lv):.1f}$ door | Session: {ev['session']}\n"
+            f"Valid: {BIG_VALID_H} ghante ({pk(valid)} Pakistan tak). Tab tak na lage to cancel karein.\n"
+            f"<i>TP1 par aadha band karein aur SL entry par le aayein.</i>"
+            + warn_line()
+        )
+    en = ev["entry"]
     return (
-        f"{icon} <b>XAUUSD {e['tf']} — {e['side']}</b> ({e['kind']})\n"
-        f"{tag}\n"
-        f"Is ghante ka signal #{e['n']} | Session: {e['session']}\n"
-        f"Entry: <code>{en:.2f}</code>\nStop Loss: <code>{sl:.2f}</code>\nTarget: <code>{tp:.2f}</code>\n"
-        f"RSI: {e['rsi']:.1f} | Candle band hui {age:.0f} minute pehle\n"
-        f"<i>Price entry se door chali gayi ho to trade na lein.</i>"
-    ), age
+        f"🔵 <b>CHHOTA SIGNAL (SCALP) — target {ev['tp']:g}$</b>\n"
+        f"{icon} XAUUSD {ev['side']} — abhi lagayein ({ev['kind']})\n"
+        f"Entry: <code>{en:.2f}</code> | Abhi price: <code>{live:.2f}</code>\n"
+        f"Stop Loss: <code>{en - sg * ev['sl']:.2f}</code> ({ev['sl']:g}$)\n"
+        f"Target: <code>{en + sg * ev['tp']:.2f}</code> ({ev['tp']:g}$)\n"
+        f"Candle band hui {age:.0f} minute pehle ({pk(ev['closed'])} Pakistan) | RSI {ev['rsi']:.0f} | {ev['session']}\n"
+        f"<i>MT5 ki price entry se {SCALP_STALE_MAX:g}$ se zyada door ho to chhor dein.</i>"
+        + warn_line()
+    )
 
 
+def fmt_result(ev, rs):
+    kind = "BADA signal" if ev["type"] == "big" else "CHHOTA signal (scalp)"
+    who = f"{kind}: {ident(ev)} ({pk(ev['closed'])} Pakistan)"
+    k = rs["kind"]
+    if k == "win":
+        return f"✅ <b>PROFIT +{rs['pnl']:g}$</b>\n{who}\nTarget lag gaya."
+    if k == "tp1":
+        return f"✅ <b>PROFIT +{rs['pnl']:g}$ (TP1)</b>\n{who}\nAadha band karein, SL entry par le aayein."
+    if k == "tp2":
+        return f"✅✅ <b>PROFIT +{rs['pnl']:g}$ (TP2)</b>\n{who}\nPura target lag gaya."
+    if k == "loss":
+        return f"❌ <b>LOSS {rs['pnl']:g}$</b>\n{who}\nStop Loss lag gaya. Agle signal ka intezar."
+    if k == "nofill":
+        return f"⏳ <b>Order fill nahi hua</b>\n{who}\n{BIG_VALID_H} ghante mein price level tak nahi aayi. Order cancel kar dein."
+    return f"⏱ <b>Time khatam</b>\n{who}\n{SCALP_EXPIRE_H} ghante mein TP/SL tak nahi pahunchi. Band kar dein."
+
+
+# -------------------------------- main --------------------------------
 def main():
     if not TEST:
         time.sleep(WAIT_SECONDS)
-    now = datetime.now(timezone.utc)
-    reg30, info30, last30 = scan("M30", "30m", 30, M30_SL, M30_TP)
-    regular, info15 = list(reg30), []
+    now = now_utc()
+    S30 = load("30m", 30)
     try:
-        reg15, info15, _ = scan("M15", "15m", 15, M15_SL, M15_TP, m15=True)
-        regular += reg15
+        S15 = load("15m", 15)
     except Exception as ex:
-        print("M15 data nahi mila, sirf M30 chalega:", ex)
-    extra = []
-    if USE_M5:
-        extra.append(("M5", "5m", 5, M5_SL, M5_TP))
-    if USE_M1:
-        extra.append(("M1", "1m", 1, M1_SL, M1_TP))
-    for nm, iv, mins, sl_, tp_ in extra:
-        try:
-            ev, _, _ = scan(nm, iv, mins, sl_, tp_, m15=True)
-            regular += ev
-        except Exception as ex:
-            print("%s data nahi mila, chhor diya: %s" % (nm, ex))
+        print("M15 data nahi mila, scalp aur natija band:", ex)
+        S15 = None
     try:
         h1 = scan_h1()
     except Exception as ex:
-        print("H1 data nahi mila, NY signal nahi banenge:", ex)
+        print("H1 data nahi mila, signal band:", ex)
         h1 = []
-    if NY_MODE == "limit":
-        big, big_keys = ny_limits(info30, h1), frozenset()
-    else:
-        big = ny_quality(regular, h1)
-        big_keys = {(e["tf"], e["closed"], e["side"]) for e in big}
-    events = build(regular, info15, big_keys) + big
-    if PENDING_ON and info15 and h1:
-        events += pending_alerts(info15, h1)
+    live = (S15 or S30)["live"]
 
     if TEST:
-        post("✅ Test message: bot theek chal raha hai. Gold price: %.2f" % last30["close"])
+        post("✅ Test message: bot theek chal raha hai. Gold price: %.2f" % live)
         return
 
+    bigs = gen_bigs(S30, h1) if h1 else []
+    scalps = gen_scalps(S15, h1) if (S15 and h1) else []
+    events = sorted(bigs + scalps, key=lambda e: e["closed"])
     sent = 0
-    for e in sorted(events, key=lambda e: e["closed"]):
-        age = (now - e["closed"]).total_seconds() / 60
-        if age > FRESH_MIN or age < 0:
+
+    for ev in events:                                   # 1) naye signal
+        age = (now - ev["closed"]).total_seconds() / 60
+        if age < 0 or age > FRESH_MIN:
             continue
-        text, _ = fmt_signal(e, now)
-        if USED:
-            text += "\n⚠️ Backup data (%s) se bana. Price aap ke broker se thora alag ho sakta hai, MT5 ki price dekh kar hi order lagayein." % ", ".join(sorted(USED))
-        post(text)
+        if ev["type"] == "big":
+            lv = ev["level"]
+            if (ev["side"] == "SELL" and live >= lv) or (ev["side"] == "BUY" and live <= lv):
+                print("Chhora (bada): price level tak/aage pahunch chuki %.2f vs %.2f" % (live, lv))
+                continue
+        else:
+            if age > SCALP_MAX_AGE or abs(live - ev["entry"]) > SCALP_STALE_MAX:
+                print("Chhora (scalp): purana/price door (%.0f min, %.2f vs %.2f)" % (age, live, ev["entry"]))
+                continue
+        post(fmt_signal(ev, live, now))
         sent += 1
+
+    wins = losses = 0
+    if RESULTS_ON and S15:                              # 2) pichle signals ka natija
+        for ev in events:
+            if now - ev["closed"] > timedelta(hours=24):
+                continue
+            for rs in outcome(ev, S15):
+                if rs["kind"] in ("win", "tp1"):
+                    wins += 1
+                elif rs["kind"] == "loss":
+                    losses += 1
+                age = (now - rs["time"]).total_seconds() / 60
+                if 0 <= age <= FRESH_MIN:
+                    post(fmt_result(ev, rs))
+                    sent += 1
 
     if sent:
         return
-    print("Koi naya signal nahi. Price %.2f RSI %.1f" % (last30["close"], last30["rsi"]))
-    age30 = (now - last30["closed"]).total_seconds() / 60
-    if last30["closed"].minute == 0 and age30 <= FRESH_MIN:  # har ghante ek khamosh report
-        sess = sess_close(now + timedelta(minutes=1))
-        trend = "UPAR (price EMA100 se upar)" if last30["close"] > last30["t"] else "NEECHE (price EMA100 se neeche)"
-        cross = "EMA20 upar hai EMA50 se" if last30["f"] > last30["s"] else "EMA20 neeche hai EMA50 se"
-        ny_line = ""
-        if sess == "New York":
-            start = now.replace(hour=13, minute=0, second=0, microsecond=0)
-            n = sum(1 for e in events if e.get("ny") and e["closed"] > start)
-            ny_line = f"NY quality signal ab tak: {n}/{NY_MAX_SIGNALS}\n"
+    print("Koi naya signal/natija nahi. Price %.2f" % live)
+    age30 = (now - S30["closed"][-1]).total_seconds() / 60
+    if S30["closed"][-1].minute == 0 and age30 <= FRESH_MIN:      # har ghante khamosh report
+        up = S30["c"][-1] > S30["t"][-1]
         post(
             "📊 <b>XAUUSD report</b>\n"
-            f"Price: <code>{last30['close']:.2f}</code>\n"
-            f"Trend: {trend}\n{cross}\n"
-            f"RSI: {last30['rsi']:.1f}\n"
-            f"Session: {sess}\n{ny_line}"
-            "Signal: abhi koi naya nahi, bot nigrani kar raha hai."
-            + ("\n⚠️ Backup data (%s) use hua." % ", ".join(sorted(USED)) if USED else ""),
+            f"Price: <code>{live:.2f}</code>\n"
+            f"Trend: {'UPAR' if up else 'NEECHE'} | RSI {S30['r'][-1]:.0f}\n"
+            f"Session: {sess_close(now + timedelta(minutes=1))}\n"
+            f"Pichle 24 ghante: ✅ {wins} profit, ❌ {losses} loss\n"
+            "Abhi koi naya signal nahi, bot nigrani kar raha hai." + warn_line(),
             silent=True,
         )
 
@@ -537,4 +493,11 @@ if __name__ == "__main__":
         main()
     except Exception as ex:
         print("Error:", ex)
-        sys.exit(1)
+        if TEST:
+            sys.exit(1)
+        try:
+            if now_utc().minute < 15 and TOKEN and CHAT_ID:
+                post("⚠️ Bot ko abhi data nahi mil raha (%s). Signal rukay hue hain, bot khud dobara koshish karta rahega." % str(ex)[:80], silent=True)
+        except Exception:
+            pass
+        sys.exit(0)
